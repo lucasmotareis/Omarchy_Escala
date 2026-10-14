@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "lucas.clock",
+  "name": "Calendário de serviço",
+  "version": "1.0.0",
+  "author": "Lucas",
+  "description": "Relógio e calendário com escala de serviço",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Calendário de serviço",
+    "description": "Escala recorrente e dias avulsos",
+    "category": "Time",
+    "allowMultiple": false
+  },
+  "omarchy": { "clonedFrom": "omarchy.clock" }
+}
