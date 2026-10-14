@@ -1,0 +1,502 @@
+#!/usr/bin/env bash
+# Interactive onboarding for the calendar sync.
+#
+# With --ics it only asks for secret iCal addresses. Otherwise it sets up the
+# gws backend. Automates: GCP project creation, Calendar API enablement, gws profile
+# layout, the scoped login, and the systemd timer.
+# Cannot automate: the OAuth consent screen, declaring the calendar scope,
+# publishing to production, and creating the Desktop OAuth client. Google
+# exposes no API for any of those.
+
+set -euo pipefail
+
+# --write answers yes to "Create and edit events from the widget?" without
+# asking, for a script or a second run.
+#
+# --ics skips Google Cloud entirely: it asks for your calendar's secret iCal
+# address and reads that instead. Read only. Run setup again without --ics to
+# go back to the Google Cloud sync.
+WRITE=0
+ICS=0
+for arg in "$@"; do
+  case "$arg" in
+    --write) WRITE=1 ;;
+    --ics) ICS=1 ;;
+    *) echo "unknown option: $arg (expected --write or --ics)"; exit 2 ;;
+  esac
+done
+
+# Deliberately empty by default. Google Cloud project ids are unique across
+# all of Google, not per account, so a hardcoded default works for exactly one
+# person on earth and fails for everyone after them. Resolved below, once we
+# know which projects this account already owns.
+PROJECT_ID="${PROJECT_ID:-}"
+PROFILE="${PROFILE:-$HOME/.config/gws-omarchy-calendar}"
+GCLOUD_CONFIG="${GCLOUD_CONFIG:-omarchy-calendar}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SYNC_BIN="$SCRIPT_DIR/omarchy-calendar-sync"
+CONFIG="$HOME/.config/omarchy/calendar-sync.json"
+SCOPE="https://www.googleapis.com/auth/calendar.readonly"
+# Lets the widget create, edit and delete events. It cannot change sharing
+# or delete a calendar, which the full calendar scope could.
+WRITE_SCOPE="https://www.googleapis.com/auth/calendar.events"
+
+step() { printf '\n==> %s\n' "$1"; }
+
+install_timer_and_sync() {
+  step "Installing the systemd timer"
+  mkdir -p "$HOME/.config/systemd/user"
+  cp "$SCRIPT_DIR/systemd/omarchy-calendar-sync."{service,timer} "$HOME/.config/systemd/user/"
+  # The shipped unit assumes the standard plugin directory. Point it at wherever
+  # this checkout actually lives, so a hand-cloned repo works too. In a sed
+  # replacement, & means the matched text and | ends the expression, so a path
+  # that contains either (or a backslash) must be escaped first.
+  local sync_bin_escaped
+  sync_bin_escaped=$(printf '%s' "$SYNC_BIN" | sed 's/[&|\\]/\\&/g')
+  sed -i "s|^ExecStart=.*|ExecStart=$sync_bin_escaped|" "$HOME/.config/systemd/user/omarchy-calendar-sync.service"
+  systemctl --user daemon-reload
+  systemctl --user enable --now omarchy-calendar-sync.timer
+
+  step "Running the first sync"
+  systemctl --user start omarchy-calendar-sync.service || true
+  systemctl --user status omarchy-calendar-sync.service --no-pager || true
+
+  cat <<EOF
+
+Done. Events land in ~/.local/state/omarchy/calendar-events.json every 5 minutes.
+
+  Logs:    journalctl --user -u omarchy-calendar-sync -f
+  Choose which calendars to show: click the clock, then the gear icon.
+EOF
+}
+
+setup_ics() {
+  step "Reading your calendar from its secret iCal address"
+  if ! python3 -c 'import icalendar, recurring_ical_events' 2>/dev/null; then
+    echo "  Installing python-icalendar and python-recurring-ical-events"
+    sudo pacman -S --needed --noconfirm python-icalendar python-recurring-ical-events
+  fi
+
+  cat <<'EOF'
+
+  In Google Calendar on the web, for each calendar you want:
+    Settings (gear) > Settings > click the calendar on the left
+    > Integrate calendar > "Secret address in iCal format" > copy
+
+  That address is a password: anyone holding it can read the calendar.
+  Reset it there if it ever leaks.
+
+  Paste one address per line. An empty line finishes.
+EOF
+  [ -t 0 ] || { echo "  Not a terminal, cannot ask for the address."; exit 1; }
+
+  local urls=() line
+  while :; do
+    read -r -p "  URL: " line || break
+    [ -n "$line" ] || break
+    # The public address and the embed link sit right next to the secret one
+    # in Google's settings, and neither works for a private calendar.
+    # The address goes in on stdin, never as an argument: arguments show to
+    # every user on the machine through ps, and the address is a password.
+    # No .pyc either: the shell reloads the plugin when its folder changes.
+    local problem
+    problem=$(printf '%s' "$line" | PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$SCRIPT_DIR" python3 -c \
+      'import sys; from omarchy_calendar_sync.ics import url_problem; print(url_problem(sys.stdin.read()))')
+    if [ -n "$problem" ]; then
+      printf '  Not this one: %s\n' "$problem"
+      continue
+    fi
+    urls+=("$line")
+  done
+  [ "${#urls[@]}" -gt 0 ] || { echo "  No address given, nothing changed."; exit 1; }
+
+  local identity=""
+  read -r -p "  Your email address (marks declined invitations, optional): " identity || true
+
+  mkdir -p "$(dirname "$CONFIG")"
+  # The new config replaces the current one only after a test sync passes.
+  # A wrong address must not break a setup that works today.
+  local candidate
+  candidate=$(mktemp "$CONFIG.XXXXXX")
+  trap 'rm -f "$candidate"' EXIT
+  # The addresses go in on file descriptor 3 and the program on stdin. As
+  # arguments, they would show to every user on the machine through ps.
+  python3 - "$CONFIG" "$candidate" "$identity" 3< <(printf '%s\n' "${urls[@]}") <<'PYEOF'
+import json, os, pathlib, sys
+
+path, candidate = pathlib.Path(sys.argv[1]), sys.argv[2]
+identity = sys.argv[3].strip()
+with os.fdopen(3) as stream:
+    urls = [line.strip() for line in stream if line.strip()]
+config = {}
+if path.exists():
+    try:
+        config = json.loads(path.read_text())
+    except ValueError:
+        config = {}
+config["backend"] = "ics"
+config["ics"] = [{"url": url.strip()} for url in urls]
+config["write"] = False
+if identity:
+    config["identity"] = identity
+# The file now holds the secret addresses.
+fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as stream:
+    stream.write(json.dumps(config, indent=2) + "\n")
+os.chmod(candidate, 0o600)
+PYEOF
+
+  step "Testing the feeds"
+  "$SYNC_BIN" --config "$candidate" || {
+    echo "  The sync failed, see above. $CONFIG is unchanged."
+    exit 1
+  }
+  mv -f "$candidate" "$CONFIG"
+  echo "  backend set to ics with ${#urls[@]} feed(s) in $CONFIG"
+
+  install_timer_and_sync
+  exit 0
+}
+
+# `read` returns non-zero at EOF, which under `set -e` would end the script
+# silently at the first prompt whenever stdin is not a terminal.
+pause() {
+  if [ ! -t 0 ]; then
+    printf '\n  Not a terminal, so not pausing. Do the step above before the login opens.\n'
+    return 0
+  fi
+  printf '\nPress Enter when done. '
+  read -r _ || true
+}
+
+[ "$ICS" = 1 ] && setup_ics
+
+if [ ! -t 0 ]; then
+  cat <<'EOF'
+Warning: stdin is not a terminal.
+
+Four of the steps below have to be done by hand in the Google Cloud Console,
+and this run cannot pause to wait for you. Run this directly in a terminal for
+the guided flow.
+
+EOF
+fi
+
+# A second run must not turn writing off behind the user's back: the
+# question defaults to what the config already says, and without a
+# terminal the config's value stands.
+CURRENT_WRITE=$(python3 -c '
+import json, pathlib, sys
+try:
+    print("1" if json.loads(pathlib.Path(sys.argv[1]).read_text()).get("write") is True else "0")
+except (OSError, ValueError, AttributeError):
+    print("0")
+' "$CONFIG" 2>/dev/null || echo 0)
+if [ "$WRITE" = 0 ]; then
+  if [ -t 0 ]; then
+    if [ "$CURRENT_WRITE" = 1 ]; then
+      printf '\nCreate and edit events from the widget? [Y/n] '
+      read -r answer || true
+      case "${answer:-}" in n|N|no|No|NO) WRITE=0 ;; *) WRITE=1 ;; esac
+    else
+      printf '\nCreate and edit events from the widget? [y/N] '
+      read -r answer || true
+      case "${answer:-}" in y|Y|yes|Yes|YES) WRITE=1 ;; esac
+    fi
+  else
+    WRITE=$CURRENT_WRITE
+  fi
+fi
+SCOPES="$SCOPE"
+if [ "$WRITE" = 1 ]; then
+  SCOPES="$SCOPE,$WRITE_SCOPE"
+fi
+
+# Set GWS to pick a specific binary when another program on PATH is also
+# named gws.
+GWS="$(command -v "${GWS:-gws}" || true)"
+[ -n "$GWS" ] || { echo "gws is required: https://github.com/googleworkspace/cli"; exit 1; }
+# The path is recorded for the timer, which runs elsewhere, so a relative one
+# would break there. Not resolved through symlinks: mise's shim is a symlink
+# to mise itself, and only works under its own name.
+case "$GWS" in /*) ;; *) GWS="$PWD/$GWS" ;; esac
+# The name is not unique. The git workspace helper is also called gws, and
+# `gws auth login` on it prints "Not in a workspace" and stops the script.
+# Captured, not piped into grep -q: under pipefail an early grep exit can
+# fail the pipe.
+gws_help=$("$GWS" --help 2>/dev/null || true)
+case "$gws_help" in
+  *"Google Workspace"*) ;;
+  *)
+    cat <<EOF
+$GWS is not the Google Workspace CLI. Another program uses the same name,
+for example the git workspace helper.
+
+Install https://github.com/googleworkspace/cli, then point this script at it:
+
+  GWS=/absolute/path/to/gws $0
+EOF
+    exit 1
+    ;;
+esac
+command -v gcloud >/dev/null || { echo "gcloud is required for automated project setup"; exit 1; }
+
+step "Using an isolated gcloud configuration so your other projects are untouched"
+gcloud config configurations describe "$GCLOUD_CONFIG" >/dev/null 2>&1 \
+  || gcloud config configurations create "$GCLOUD_CONFIG" --no-activate
+export CLOUDSDK_ACTIVE_CONFIG_NAME="$GCLOUD_CONFIG"
+
+step "Signing in to Google Cloud"
+if gcloud auth list --filter=status:ACTIVE --format='value(account)' | grep -q .; then
+  echo "  already signed in as $(gcloud auth list --filter=status:ACTIVE --format='value(account)')"
+else
+  gcloud auth login
+fi
+
+step "Finding or creating the Google Cloud project"
+if [ -n "$PROJECT_ID" ]; then
+  echo "  using PROJECT_ID from your environment: $PROJECT_ID"
+  # An explicit id may or may not exist yet, and `describe` cannot tell
+  # "absent" from "someone else owns it", so only create when the account
+  # genuinely has no such project of its own.
+  if ! gcloud projects list --filter="projectId = $PROJECT_ID" --format='value(projectId)' | grep -q .; then
+    gcloud projects create "$PROJECT_ID" --name="$PROJECT_ID"
+  fi
+else
+  # Reuse the one this account already made, so rerunning does not litter the
+  # console with a new project every time.
+  PROJECT_ID=$(gcloud projects list --filter="projectId ~ ^omarchy-cal" --format='value(projectId)' --limit=1 2>/dev/null || true)
+
+  if [ -n "$PROJECT_ID" ]; then
+    echo "  reusing the project you already have: $PROJECT_ID"
+  else
+    # Random suffix rather than a name derived from the account, because ids
+    # are world visible and an email local part does not belong in one.
+    PROJECT_ID="omarchy-cal-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
+    echo "  creating $PROJECT_ID"
+    if ! gcloud projects create "$PROJECT_ID" --name="Omarchy Calendar"; then
+      cat <<EOF
+
+Creating the project failed. Two common reasons:
+
+  - You are at Google's project quota. Delete an unused project, or pass one
+    you already own:  PROJECT_ID=my-existing-project $0
+  - The id collided. Simply run this again, the next id will differ.
+EOF
+      exit 1
+    fi
+  fi
+fi
+gcloud config set project "$PROJECT_ID"
+
+step "Enabling the Calendar API"
+gcloud services enable calendar-json.googleapis.com --project="$PROJECT_ID"
+
+step "Manual step 1 of 4: configure the OAuth consent screen"
+cat <<EOF
+Open:
+  https://console.cloud.google.com/auth/overview?project=$PROJECT_ID
+
+  If you land on a "Get started" form, fill it in:
+    App name:            Omarchy Calendar
+    User support email:  your own address
+    Audience:            External
+    Contact information: your own address
+
+  If you land on an "OAuth Overview" page with metrics instead, this project
+  is already configured and there is nothing to do here.
+EOF
+pause
+
+step "Manual step 2 of 4: declare the calendar scope"
+cat <<EOF
+Open:
+  https://console.cloud.google.com/auth/scopes?project=$PROJECT_ID
+
+  Click "Add or remove scopes"
+  Filter for:  calendar.readonly
+  Tick:        $SCOPE
+               ("See and download any calendar you can access")
+EOF
+if [ "$WRITE" = 1 ]; then
+  cat <<EOF
+  Also tick:   $WRITE_SCOPE
+               ("View and edit events on all your calendars")
+EOF
+fi
+cat <<EOF
+  Update, then Save
+
+  If Save is greyed out, fill in "How will the scopes be used?" with
+  something like: Read-only display of my own calendar in a desktop
+  status bar widget.
+
+Do not skip this. A scope that is not declared here is not offered on the
+consent screen at all, so there is no box to tick, Google grants only your
+email address, and every sync fails with 403 insufficient scopes. Google will
+warn that sensitive scopes need verification; that is expected and harmless
+for personal use, which stays under the unverified cap.
+EOF
+pause
+
+step "Manual step 3 of 4: publish the app"
+cat <<EOF
+Open:
+  https://console.cloud.google.com/auth/audience?project=$PROJECT_ID
+
+  Under "Publishing status", click "Publish app"
+
+  If it already reads "In production" there is nothing to do. The button
+  disappears once published and is replaced by "Back to testing".
+
+This matters. In Testing, Google expires refresh tokens after 7 days and your
+calendar silently stops updating. Unverified production apps show a one time
+warning screen and then work indefinitely for personal use.
+EOF
+pause
+
+step "Manual step 4 of 4: create a Desktop OAuth client"
+cat <<EOF
+Open:
+  https://console.cloud.google.com/auth/clients?project=$PROJECT_ID
+
+  Create client
+  Application type:  Desktop app
+  Name:              Omarchy Calendar Sync
+
+Then click "Download JSON". The secret is not shown again after you close
+that dialog.
+EOF
+pause
+
+mkdir -p "$PROFILE"
+if [ -f "$PROFILE/client_secret.json" ]; then
+  step "Client secret is already installed at $PROFILE/client_secret.json, skipping"
+else
+  step "Installing the client secret"
+  downloaded=$(find "$HOME/Downloads" -maxdepth 1 -name 'client_secret_*.json' -print -quit 2>/dev/null || true)
+  if [ -n "$downloaded" ]; then
+    mv "$downloaded" "$PROFILE/client_secret.json"
+  else
+    printf 'Path to the downloaded JSON (rerunning? it belongs at %s): ' "$PROFILE/client_secret.json"
+    read -r manual
+    cp "${manual/#\~/$HOME}" "$PROFILE/client_secret.json"
+  fi
+fi
+chmod 600 "$PROFILE/client_secret.json"
+
+step "Signing in with read-only calendar access"
+cat <<'EOF'
+On the consent screen, TICK THE CHECKBOX granting read access to your
+calendars before clicking Continue. It is not ticked for you.
+
+Clicking Continue without it still reports a successful login, but grants only
+your email address, and every sync then fails with 403 insufficient scopes.
+EOF
+if [ "$WRITE" = 1 ]; then
+  echo "You asked to create and edit events, so tick the events checkbox too."
+fi
+# gws caches the access token next to the credentials. A cache minted before
+# the calendar scope was granted keeps being served afterwards, and every
+# call fails with 403 insufficient scopes until it is cleared.
+rm -f "$PROFILE/token_cache.json"
+GOOGLE_WORKSPACE_CLI_CONFIG_DIR="$PROFILE" "$GWS" auth login --scopes "$SCOPES"
+
+step "Checking the calendar scope was actually granted"
+granted=$(GOOGLE_WORKSPACE_CLI_CONFIG_DIR="$PROFILE" "$GWS" auth status 2>/dev/null || true)
+for wanted in ${SCOPES//,/ }; do
+  case "$granted" in
+    # Quoted, as auth status prints JSON strings: calendar.events must not
+    # match calendar.events.readonly.
+    *"\"$wanted\""*) echo "  ${wanted##*/} granted" ;;
+    *)
+      cat <<EOF
+
+The scope ${wanted##*/} was NOT granted. gws is holding a token without it.
+
+This almost always means its checkbox on the consent screen was left
+unticked. Run this script again and tick it.
+
+  granted scopes: $(printf '%s\n' "$granted" | grep -A6 '"scopes"' | grep googleapis || echo "identity only")
+EOF
+      exit 1
+      ;;
+  esac
+done
+
+step "Verifying calendar access"
+# Surface a real error rather than reading `items` out of an error body and
+# reporting it as zero calendars.
+GOOGLE_WORKSPACE_CLI_CONFIG_DIR="$PROFILE" "$GWS" calendar calendarList list 2>/dev/null \
+  | python3 -c '
+import json, sys
+
+payload = json.load(sys.stdin)
+error = payload.get("error")
+if error:
+    print("  calendar access failed:", error.get("code"), error.get("message"))
+    raise SystemExit(1)
+
+count = len(payload.get("items", []))
+print(" ", count, "calendars reachable")
+if count == 0:
+    print("  That is unusual. Check that this Google account has any calendars.")
+'
+
+step "Recording where gws and your credentials live"
+# The timer runs with the PATH its unit sets, not your shell PATH, so the bare
+# name is not enough. An absolute path is not always enough either: a version
+# manager's npm wrapper execs node, and node may only be on your shell PATH.
+# So run gws the way the timer will before recording it.
+timer_path=$(sed -n 's/^Environment=PATH=//p' "$SCRIPT_DIR/systemd/omarchy-calendar-sync.service")
+timer_path=${timer_path//"%h"/$HOME}
+runs_under_timer() { env -i HOME="$HOME" PATH="$timer_path" "$1" --version 2>&1; }
+
+gws_path=$GWS
+if ! timer_output=$(runs_under_timer "$gws_path"); then
+  # mise's shim finds node by itself, and it survives upgrades. The install
+  # path does not: it embeds the gws version.
+  mise_shim="${MISE_DATA_DIR:-$HOME/.local/share/mise}/shims/gws"
+  if [ -x "$mise_shim" ] && runs_under_timer "$mise_shim" >/dev/null; then
+    echo "  $gws_path needs your shell PATH, so recording the mise shim instead"
+    gws_path=$mise_shim
+  else
+    cat <<EOF
+
+  Warning: $gws_path does not run under the timer's PATH, so every sync
+  will fail. It printed:
+
+    ${timer_output:-nothing}
+
+  Set gwsPath in $CONFIG to a gws that
+  runs without your shell PATH.
+
+EOF
+  fi
+fi
+mkdir -p "$(dirname "$CONFIG")"
+python3 - "$CONFIG" "$gws_path" "$PROFILE" "$WRITE" <<'PYEOF'
+import json, pathlib, sys
+
+path, gws_path, profile = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+write = sys.argv[4] == "1"
+config = {}
+if path.exists():
+    try:
+        config = json.loads(path.read_text())
+    except ValueError:
+        config = {}
+# This flow sets up the Google Cloud sync, so it must also select it.
+# Without this line, a config left by setup --ics keeps reading the feeds.
+config["backend"] = "gws"
+config["gwsPath"] = gws_path
+config["profile"] = profile
+config["write"] = write
+path.write_text(json.dumps(config, indent=2) + "\n")
+print("  backend set to gws")
+print("  gwsPath set to", gws_path)
+print("  profile set to", profile)
+print("  write set to", write)
+PYEOF
+
+install_timer_and_sync

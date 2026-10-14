@@ -1,21 +1,19 @@
 # Omarchy_Escala
 
-Calendário de serviço para Omarchy.
-
-Plugin local baseado no relógio do Omarchy 4.0.4. Ele mostra uma escala recorrente no calendário, calcula o próximo serviço a partir de hoje e guarda alterações no `~/.config/omarchy/shell.json`.
-
-## Uso
-
-1. Clique no relógio da barra.
-2. Escolha **CONFIGURAR ESCALA**.
-3. Digite a data do primeiro dia de serviço em `AAAA-MM-DD`, a quantidade de dias seguidos de serviço e a quantidade de dias seguidos de folga. Exemplo: `2026-10-14`, `2`, `6`.
-4. Clique em **SALVAR**. O dia inicial conta como o primeiro dia de serviço.
-5. Clique num dia do calendário para criar uma exceção: num dia de folga, adiciona serviço; num dia de serviço, marca folga. Clique novamente para remover a exceção.
-
-Os dias de serviço recebem fundo colorido. Uma borda colorida indica um dia avulso ou uma folga excepcional; o dia de hoje também tem borda. O resumo mostra o próximo serviço **incluindo hoje**. As exceções não deslocam a sequência da escala.
-
-Para mudar a configuração depois, abra **CONFIGURAR ESCALA** novamente. O relógio mantém seus formatos e outras preferências já existentes.
+Um único calendário na barra do Omarchy: os eventos do [omarchy-calendar](https://github.com/tmn73/omarchy-calendar) e uma escala de serviço recorrente. Esta versão combina o omarchy-calendar 0.7.4 com a escala criada neste projeto. O código do calendário original é distribuído sob a licença MIT, preservada em [LICENSE](LICENSE).
 
 ## Instalação
 
-Execute `./install.sh` nesta pasta. O script faz backup de `shell.json`, instala o plugin em `~/.config/omarchy/plugins/lucas.clock` e substitui a entrada `omarchy.clock` na barra por `lucas.clock`. A configuração do relógio é copiada para a nova entrada. Se o Omarchy Shell estiver aberto, reinicie com `omarchy restart shell` caso a mudança não apareça automaticamente.
+Clone este repositório e execute `./install.sh`. O instalador valida o plugin, faz backup de `~/.config/omarchy/shell.json`, instala `lucas.calendar` e troca as entradas `lucas.clock` e `tmn73.calendar` da barra por um único calendário. A configuração atual da escala e as preferências do omarchy-calendar são copiadas para a nova entrada. Os plugins antigos continuam no disco, mas saem da barra.
+
+Se o Omarchy Shell estiver aberto e não aplicar a mudança automaticamente, execute `omarchy restart shell`.
+
+## Escala
+
+Abra o calendário e, sob o mês, escolha **Configurar**. Informe a data do primeiro dia de serviço em `AAAA-MM-DD`, a quantidade de dias seguidos de serviço e os dias seguidos de folga. Exemplo: `2026-10-21`, `2`, `6`. O resumo mostra o próximo serviço, incluindo hoje quando for dia de serviço.
+
+Um clique normal no dia continua selecionando a agenda. Para adicionar serviço avulso ou retirar um plantão, selecione o dia e use o botão ao lado de **Configurar**. Clique novamente em **Remover avulso** para desfazer. A exceção altera apenas a data selecionada; o ciclo seguinte mantém a sequência original. Dias de serviço têm fundo colorido e exceções têm borda colorida. Os pontos de eventos do calendário continuam visíveis.
+
+Os dados da escala ficam na entrada `lucas.calendar` de `~/.config/omarchy/shell.json`. Eventos sincronizados continuam em `~/.local/state/omarchy/calendar-events.json`. Este repositório não contém seus eventos ou credenciais.
+
+Para configurar a sincronização de eventos, consulte a [documentação do omarchy-calendar](https://github.com/tmn73/omarchy-calendar#readme). Se já existe uma sincronização, o calendário combinado continua lendo o mesmo arquivo de eventos. Se for remover o plugin original, execute antes `~/.config/omarchy/plugins/lucas.calendar/sync/setup` para atualizar o caminho do serviço de sincronização.

@@ -1,21 +1,124 @@
 {
   "schemaVersion": 1,
-  "id": "lucas.clock",
-  "name": "Calendário de serviço",
-  "version": "1.0.0",
-  "author": "Lucas",
-  "description": "Relógio e calendário com escala de serviço",
+  "id": "lucas.calendar",
+  "name": "Calendar + Escala",
+  "version": "0.7.4",
+  "author": "tmn73, Lucas",
+  "license": "MIT",
+  "description": "Calendar events and a recurring work schedule in one bar widget.",
   "kinds": [
     "bar-widget"
   ],
+  "omarchy": {
+    "clonedFrom": "omarchy.clock"
+  },
   "entryPoints": {
     "barWidget": "BarWidget.qml"
   },
   "barWidget": {
-    "displayName": "Calendário de serviço",
-    "description": "Escala recorrente e dias avulsos",
+    "displayName": "Calendar + Escala",
+    "description": "Calendar events and a recurring work schedule.",
     "category": "Time",
-    "allowMultiple": false
-  },
-  "omarchy": { "clonedFrom": "omarchy.clock" }
+    "allowMultiple": false,
+    "defaults": {
+      "format": "dddd HH:mm",
+      "formatAlt": "d MMMM 'W'ww yyyy",
+      "verticalFormat": "HH\n-\nmm",
+      "eventTimeFormat": "HH:mm",
+      "language": "auto",
+      "reminders": true,
+      "announceLeadMinutes": 15,
+      "duringEvent": "untilEnd",
+      "nextDuringEvent": "announce"
+    },
+    "schema": [
+      {
+        "key": "format",
+        "type": "string",
+        "label": "Date format",
+        "defaultValue": "dddd HH:mm"
+      },
+      {
+        "key": "formatAlt",
+        "type": "string",
+        "label": "Alternate format",
+        "defaultValue": "d MMMM 'W'ww yyyy"
+      },
+      {
+        "key": "verticalFormat",
+        "type": "string",
+        "label": "Vertical bar format",
+        "defaultValue": "HH\n-\nmm"
+      },
+      {
+        "key": "eventTimeFormat",
+        "type": "string",
+        "label": "Event time format",
+        "defaultValue": "HH:mm"
+      },
+      {
+        "key": "language",
+        "type": "enum",
+        "label": "Language",
+        "options": [
+          "auto",
+          "en",
+          "pt"
+        ],
+        "defaultValue": "auto",
+        "description": "auto follows the system locale (Portuguese for pt_*, otherwise English)."
+      },
+      {
+        "key": "reminders",
+        "type": "boolean",
+        "label": "Desktop reminders",
+        "defaultValue": true,
+        "description": "Notify at each event's reminder times; meetings with a link get one 10 minutes before."
+      },
+      {
+        "key": "announceLeadMinutes",
+        "type": "number",
+        "label": "Announce events (minutes before)",
+        "min": 0,
+        "max": 120,
+        "step": 5,
+        "defaultValue": 15,
+        "description": "Show the next event beside the clock this long before it starts. 0 keeps the clock alone."
+      },
+      {
+        "key": "duringEvent",
+        "type": "enum",
+        "label": "During an event",
+        "options": [
+          "untilEnd",
+          "firstMinutes"
+        ],
+        "defaultValue": "untilEnd",
+        "description": "untilEnd keeps \"Now\" on until the event ends. firstMinutes shows it for the first 2 minutes."
+      },
+      {
+        "key": "nextDuringEvent",
+        "type": "enum",
+        "label": "Next event during one",
+        "options": [
+          "announce",
+          "keep"
+        ],
+        "defaultValue": "announce",
+        "description": "announce shows the next event once it is due. keep stays on the current event until it ends."
+      },
+      {
+        "key": "birthYear",
+        "type": "number",
+        "label": "Birth year",
+        "defaultValue": 0
+      },
+      {
+        "key": "lifeExpectancy",
+        "type": "number",
+        "label": "Life expectancy",
+        "defaultValue": 0
+      }
+    ]
+  }
 }
